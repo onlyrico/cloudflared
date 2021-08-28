@@ -7,7 +7,7 @@ from util import start_cloudflared, wait_tunnel_ready, send_requests
 # Rolling logger rotate log files after 1 MB
 rotate_after_size = 1000 * 1000
 default_log_file = "cloudflared.log"
-expect_message = "Starting Hello World server"
+expect_message = "Starting Hello"
 
 
 def assert_log_to_terminal(cloudflared):
@@ -17,7 +17,7 @@ def assert_log_to_terminal(cloudflared):
 
 def assert_log_in_file(file):
     with open(file, "r") as f:
-        log = f.read(1850)
+        log = f.read(2000)
         assert expect_message in log, f"{log} doesn't contain {expect_message}"
 
 

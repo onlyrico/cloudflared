@@ -1,6 +1,54 @@
 **Experimental**: This is a new format for release notes. The format and availability is subject to change.
 
-## 2020.5.0
+## 2021.8.4
+### Improvements
+- Temporary tunnels (those hosted on trycloudflare.com that do not require a Cloudflare login) now run as Named Tunnels
+underneath. We recall that these tunnels should not be relied upon for production usage as they come with no guarantee
+of uptime. Previous cloudflared versions will soon be unable to run legacy temporary tunnels and will require an update
+(to this version or more recent).
+
+## 2021.8.2
+### Improvements
+- Because Equinox os shutting down, all cloudflared releases are now present [here](https://github.com/cloudflare/cloudflared/releases).
+[Equinox](https://dl.equinox.io/cloudflare/cloudflared/stable) will no longer receive updates. 
+
+## 2021.8.0
+### Bug fixes
+- Prevents tunnel from accidentally running when only proxy-dns should run. 
+
+### Improvements
+- If auto protocol transport lookup fails, we now default to a transport instead of not connecting.
+
+## 2021.6.0
+### Bug Fixes
+- Fixes a http2 transport (the new default for Named Tunnels) to work with unix socket origins.
+
+
+## 2021.5.10
+### Bug Fixes
+- Fixes a memory leak in h2mux transport that connects cloudflared to Cloudflare edge.
+
+
+## 2021.5.9
+### New Features
+- Uses new Worker based login helper service to facilitate token exchange in cloudflared flows.
+
+### Bug Fixes
+- Fixes Centos-7 builds.
+
+## 2021.5.8
+### New Features
+- When creating a DNS record to point a hostname at a tunnel, you can now use --overwrite-dns to overwrite any existing
+  DNS records with that hostname. This works both when using the CLI to provision DNS, as well as when starting an adhoc
+  named tunnel, e.g.:
+  - `cloudflared tunnel route dns --overwrite-dns foo-tunnel foo.example.com`
+  - `cloudflared tunnel --overwrite-dns --name foo-tunnel --hostname foo.example.com`
+
+## 2021.5.7
+### New Features
+- Named Tunnels will automatically select the protocol to connect to Cloudflare's edge network.
+
+## 2021.5.0
 
 ### New Features
 - It is now possible to run the same tunnel using more than one `cloudflared` instance. This is a server-side change and

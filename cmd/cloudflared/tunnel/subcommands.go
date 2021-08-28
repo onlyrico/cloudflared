@@ -29,10 +29,11 @@ import (
 )
 
 const (
-	allSortByOptions   = "name, id, createdAt, deletedAt, numConnections"
-	connsSortByOptions = "id, startedAt, numConnections, version"
-	CredFileFlagAlias  = "cred-file"
-	CredFileFlag       = "credentials-file"
+	allSortByOptions     = "name, id, createdAt, deletedAt, numConnections"
+	connsSortByOptions   = "id, startedAt, numConnections, version"
+	CredFileFlagAlias    = "cred-file"
+	CredFileFlag         = "credentials-file"
+	overwriteDNSFlagName = "overwrite-dns"
 
 	LogFieldTunnelID = "tunnelID"
 )
@@ -47,6 +48,16 @@ var (
 		Name:    "name",
 		Aliases: []string{"n"},
 		Usage:   "List tunnels with the given `NAME`",
+	}
+	listNamePrefixFlag = &cli.StringFlag{
+		Name:    "name-prefix",
+		Aliases: []string{"np"},
+		Usage:   "List tunnels that start with the give `NAME` prefix",
+	}
+	listExcludeNamePrefixFlag = &cli.StringFlag{
+		Name:    "exclude-name-prefix",
+		Aliases: []string{"enp"},
+		Usage:   "List tunnels whose `NAME` does not start with the given prefix",
 	}
 	listExistedAtFlag = &cli.TimestampFlag{
 		Name:        "when",
@@ -110,7 +121,7 @@ var (
 	}
 	selectProtocolFlag = altsrc.NewStringFlag(&cli.StringFlag{
 		Name:    "protocol",
-		Value:   "h2mux",
+		Value:   "auto",
 		Aliases: []string{"p"},
 		Usage:   fmt.Sprintf("Protocol implementation to connect with Cloudflare's edge network. %s", connection.AvailableProtocolFlagMessage),
 		EnvVars: []string{"TUNNEL_TRANSPORT_PROTOCOL"},
@@ -132,6 +143,12 @@ var (
 		Aliases: []string{"c"},
 		Usage:   `Constraints the cleanup to stop the connections of a single Connector (by its ID). You can find the various Connectors (and their IDs) currently connected to your tunnel via 'cloudflared tunnel info <name>'.`,
 		EnvVars: []string{"TUNNEL_CLEANUP_CONNECTOR"},
+	}
+	overwriteDNSFlag = &cli.BoolFlag{
+		Name:    overwriteDNSFlagName,
+		Aliases: []string{"f"},
+		Usage:   `Overwrites existing DNS records with this hostname`,
+		EnvVars: []string{"TUNNEL_FORCE_PROVISIONING_DNS"},
 	}
 )
 
@@ -210,6 +227,8 @@ func buildListCommand() *cli.Command {
 			outputFormatFlag,
 			showDeletedFlag,
 			listNameFlag,
+			listNamePrefixFlag,
+			listExcludeNamePrefixFlag,
 			listExistedAtFlag,
 			listIDFlag,
 			showRecentlyDisconnected,
@@ -235,6 +254,12 @@ func listCommand(c *cli.Context) error {
 	}
 	if name := c.String("name"); name != "" {
 		filter.ByName(name)
+	}
+	if namePrefix := c.String("name-prefix"); namePrefix != "" {
+		filter.ByNamePrefix(namePrefix)
+	}
+	if excludePrefix := c.String("exclude-name-prefix"); excludePrefix != "" {
+		filter.ExcludeNameWithPrefix(excludePrefix)
 	}
 	if existedAt := c.Timestamp("time"); existedAt != nil {
 		filter.ByExistedAt(*existedAt)
@@ -648,7 +673,6 @@ func cleanupCommand(c *cli.Context) error {
 func buildRouteCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "route",
-		Action:    cliutil.ConfiguredAction(routeCommand),
 		Usage:     "Define which traffic routed from Cloudflare edge to this tunnel: requests to a DNS hostname, to a Cloudflare Load Balancer, or traffic originating from Cloudflare WARP clients",
 		UsageText: "cloudflared tunnel [tunnel command options] route [subcommand options] [dns TUNNEL HOSTNAME]|[lb TUNNEL HOSTNAME LB-POOL]|[ip NETWORK TUNNEL]",
 		Description: `The route command defines how Cloudflare will proxy requests to this tunnel.
@@ -668,15 +692,30 @@ Further information about managing Cloudflare WARP traffic to your tunnel is ava
 `,
 		CustomHelpTemplate: commandHelpTemplate(),
 		Subcommands: []*cli.Command{
+			{
+				Name:        "dns",
+				Action:      cliutil.ConfiguredAction(routeDnsCommand),
+				Usage:       "Route a hostname by creating a DNS CNAME record to a tunnel",
+				UsageText:   "cloudflared tunnel route dns [TUNNEL] [HOSTNAME]",
+				Description: `Creates a DNS CNAME record hostname that points to the tunnel.`,
+				Flags:       []cli.Flag{overwriteDNSFlag},
+			},
+			{
+				Name:        "lb",
+				Action:      cliutil.ConfiguredAction(routeLbCommand),
+				Usage:       "Use this tunnel as a load balancer origin, creating pool and load balancer if necessary",
+				UsageText:   "cloudflared tunnel route dns [TUNNEL] [HOSTNAME] [LB-POOL]",
+				Description: `Creates Load Balancer with an origin pool that points to the tunnel.`,
+			},
 			buildRouteIPSubcommand(),
 		},
 	}
 }
 
-func dnsRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
+func dnsRouteFromArg(c *cli.Context, overwriteExisting bool) (tunnelstore.Route, error) {
 	const (
-		userHostnameIndex = 2
-		expectedNArgs     = 3
+		userHostnameIndex = 1
+		expectedNArgs     = 2
 	)
 	if c.NArg() != expectedNArgs {
 		return nil, cliutil.UsageError("Expected %d arguments, got %d", expectedNArgs, c.NArg())
@@ -687,14 +726,14 @@ func dnsRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
 	} else if !validateHostname(userHostname, true) {
 		return nil, errors.Errorf("%s is not a valid hostname", userHostname)
 	}
-	return tunnelstore.NewDNSRoute(userHostname), nil
+	return tunnelstore.NewDNSRoute(userHostname, overwriteExisting), nil
 }
 
 func lbRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
 	const (
-		lbNameIndex   = 2
-		lbPoolIndex   = 3
-		expectedNArgs = 4
+		lbNameIndex   = 1
+		lbPoolIndex   = 2
+		expectedNArgs = 3
 	)
 	if c.NArg() != expectedNArgs {
 		return nil, cliutil.UsageError("Expected %d arguments, got %d", expectedNArgs, c.NArg())
@@ -736,41 +775,39 @@ func validateHostname(s string, allowWildcardSubdomain bool) bool {
 	return err == nil && validateName(puny, allowWildcardSubdomain)
 }
 
-func routeCommand(c *cli.Context) error {
-	if c.NArg() < 2 {
-		return cliutil.UsageError(`"cloudflared tunnel route" requires the first argument to be the route type(dns or lb), followed by the ID or name of the tunnel`)
+func routeDnsCommand(c *cli.Context) error {
+	if c.NArg() != 2 {
+		return cliutil.UsageError(`This command expects the format "cloudflared tunnel route dns <tunnel name/id> <hostname>"`)
 	}
+	return routeCommand(c, "dns")
+}
+
+func routeLbCommand(c *cli.Context) error {
+	if c.NArg() != 3 {
+		return cliutil.UsageError(`This command expects the format "cloudflared tunnel route lb <tunnel name/id> <hostname> <load balancer pool>"`)
+	}
+	return routeCommand(c, "lb")
+}
+
+func routeCommand(c *cli.Context, routeType string) error {
 	sc, err := newSubcommandContext(c)
 	if err != nil {
 		return err
 	}
 
-	const tunnelIDIndex = 1
-
-	routeType := c.Args().First()
+	tunnelID, err := sc.findID(c.Args().Get(0))
+	if err != nil {
+		return err
+	}
 	var route tunnelstore.Route
-	var tunnelID uuid.UUID
 	switch routeType {
 	case "dns":
-		tunnelID, err = sc.findID(c.Args().Get(tunnelIDIndex))
-		if err != nil {
-			return err
-		}
-		route, err = dnsRouteFromArg(c)
-		if err != nil {
-			return err
-		}
+		route, err = dnsRouteFromArg(c, c.Bool(overwriteDNSFlagName))
 	case "lb":
-		tunnelID, err = sc.findID(c.Args().Get(tunnelIDIndex))
-		if err != nil {
-			return err
-		}
 		route, err = lbRouteFromArg(c)
-		if err != nil {
-			return err
-		}
-	default:
-		return cliutil.UsageError("%s is not a recognized route type. Supported route types are dns and lb", routeType)
+	}
+	if err != nil {
+		return err
 	}
 
 	res, err := sc.route(tunnelID, route)
