@@ -1,19 +1,23 @@
 package tunnel
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/cloudflare/cloudflared/tunnelstore"
+	"github.com/cloudflare/cloudflared/cfapi"
+	"github.com/cloudflare/cloudflared/connection"
 )
 
 func Test_fmtConnections(t *testing.T) {
 	type args struct {
-		connections []tunnelstore.Connection
+		connections []cfapi.Connection
 	}
 	tests := []struct {
 		name string
@@ -23,14 +27,14 @@ func Test_fmtConnections(t *testing.T) {
 		{
 			name: "empty",
 			args: args{
-				connections: []tunnelstore.Connection{},
+				connections: []cfapi.Connection{},
 			},
 			want: "",
 		},
 		{
 			name: "trivial",
 			args: args{
-				connections: []tunnelstore.Connection{
+				connections: []cfapi.Connection{
 					{
 						ColoName: "DFW",
 						ID:       uuid.MustParse("ea550130-57fd-4463-aab1-752822231ddd"),
@@ -42,7 +46,7 @@ func Test_fmtConnections(t *testing.T) {
 		{
 			name: "with a pending reconnect",
 			args: args{
-				connections: []tunnelstore.Connection{
+				connections: []cfapi.Connection{
 					{
 						ColoName:           "DFW",
 						ID:                 uuid.MustParse("ea550130-57fd-4463-aab1-752822231ddd"),
@@ -55,7 +59,7 @@ func Test_fmtConnections(t *testing.T) {
 		{
 			name: "many colos",
 			args: args{
-				connections: []tunnelstore.Connection{
+				connections: []cfapi.Connection{
 					{
 						ColoName: "YRV",
 						ID:       uuid.MustParse("ea550130-57fd-4463-aab1-752822231ddd"),
@@ -176,4 +180,25 @@ func Test_validateHostname(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_TunnelToken(t *testing.T) {
+	token, err := ParseToken("aabc")
+	require.Error(t, err)
+	require.Nil(t, token)
+
+	expectedToken := &connection.TunnelToken{
+		AccountTag:   "abc",
+		TunnelSecret: []byte("secret"),
+		TunnelID:     uuid.New(),
+	}
+
+	tokenJsonStr, err := json.Marshal(expectedToken)
+	require.NoError(t, err)
+
+	token64 := base64.StdEncoding.EncodeToString(tokenJsonStr)
+
+	token, err = ParseToken(token64)
+	require.NoError(t, err)
+	require.Equal(t, token, expectedToken)
 }

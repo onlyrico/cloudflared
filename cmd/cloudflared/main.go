@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/getsentry/raven-go"
+	"github.com/getsentry/sentry-go"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
@@ -15,12 +16,15 @@ import (
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/access"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/proxydns"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/tail"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/tunnel"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/metrics"
 	"github.com/cloudflare/cloudflared/overwatch"
+	"github.com/cloudflare/cloudflared/token"
+	"github.com/cloudflare/cloudflared/tracing"
 	"github.com/cloudflare/cloudflared/watcher"
 )
 
@@ -31,6 +35,7 @@ const (
 var (
 	Version   = "DEV"
 	BuildTime = "unknown"
+	BuildType = ""
 	// Mostly network errors that we don't want reported back to Sentry, this is done by substring match.
 	ignoredErrors = []string{
 		"connection reset by peer",
@@ -45,10 +50,13 @@ var (
 )
 
 func main() {
+	// FIXME: TUN-8148: Disable QUIC_GO ECN due to bugs in proper detection if supported
+	os.Setenv("QUIC_GO_DISABLE_ECN", "1")
+
 	rand.Seed(time.Now().UnixNano())
-	metrics.RegisterBuildInfo(BuildTime, Version)
-	raven.SetRelease(Version)
+	metrics.RegisterBuildInfo(BuildType, BuildTime, Version)
 	maxprocs.Set()
+	bInfo := cliutil.GetBuildInfo(BuildType, Version)
 
 	// Graceful shutdown channel used by the app. When closed, app must terminate gracefully.
 	// Windows service manager closes this channel when it receives stop command.
@@ -67,23 +75,26 @@ func main() {
 	app.Copyright = fmt.Sprintf(
 		`(c) %d Cloudflare Inc.
    Your installation of cloudflared software constitutes a symbol of your signature indicating that you accept
-   the terms of the Cloudflare License (https://developers.cloudflare.com/argo-tunnel/license/),
+   the terms of the Apache License Version 2.0 (https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/license),
    Terms (https://www.cloudflare.com/terms/) and Privacy Policy (https://www.cloudflare.com/privacypolicy/).`,
 		time.Now().Year(),
 	)
-	app.Version = fmt.Sprintf("%s (built %s)", Version, BuildTime)
+	app.Version = fmt.Sprintf("%s (built %s%s)", Version, BuildTime, bInfo.GetBuildTypeMsg())
 	app.Description = `cloudflared connects your machine or user identity to Cloudflare's global network.
 	You can use it to authenticate a session to reach an API behind Access, route web traffic to this machine,
 	and configure access control.
 
-	See https://developers.cloudflare.com/argo-tunnel/ for more in-depth documentation.`
+	See https://developers.cloudflare.com/cloudflare-one/connections/connect-apps for more in-depth documentation.`
 	app.Flags = flags()
 	app.Action = action(graceShutdownC)
 	app.Commands = commands(cli.ShowVersion)
 
-	tunnel.Init(Version, graceShutdownC) // we need this to support the tunnel sub command...
-	access.Init(graceShutdownC)
-	updater.Init(Version)
+	tunnel.Init(bInfo, graceShutdownC) // we need this to support the tunnel sub command...
+	access.Init(graceShutdownC, Version)
+	updater.Init(bInfo)
+	tracing.Init(Version)
+	token.Init(Version)
+	tail.Init(bInfo)
 	runApp(app, graceShutdownC)
 }
 
@@ -123,16 +134,28 @@ To determine if an update happened in a script, check for error code 11.`,
 		{
 			Name: "version",
 			Action: func(c *cli.Context) (err error) {
+				if c.Bool("short") {
+					fmt.Println(strings.Split(c.App.Version, " ")[0])
+					return nil
+				}
 				version(c)
 				return nil
 			},
 			Usage:       versionText,
 			Description: versionText,
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:    "short",
+					Aliases: []string{"s"},
+					Usage:   "print just the version number",
+				},
+			},
 		},
 	}
 	cmds = append(cmds, tunnel.Commands()...)
 	cmds = append(cmds, proxydns.Command(false))
 	cmds = append(cmds, access.Commands()...)
+	cmds = append(cmds, tail.Command())
 	return cmds
 }
 
@@ -150,10 +173,10 @@ func action(graceShutdownC chan struct{}) cli.ActionFunc {
 		if isEmptyInvocation(c) {
 			return handleServiceMode(c, graceShutdownC)
 		}
-		tags := make(map[string]string)
-		tags["hostname"] = c.String("hostname")
-		raven.SetTagsContext(tags)
-		raven.CapturePanic(func() { err = tunnel.TunnelCommand(c) }, nil)
+		func() {
+			defer sentry.Recover()
+			err = tunnel.TunnelCommand(c)
+		}()
 		if err != nil {
 			captureError(err)
 		}
@@ -181,7 +204,7 @@ func captureError(err error) {
 			return
 		}
 	}
-	raven.CaptureError(err, nil)
+	sentry.CaptureException(err)
 }
 
 // cloudflared was started without any flags

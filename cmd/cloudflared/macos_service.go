@@ -1,4 +1,4 @@
-// +build darwin
+//go:build darwin
 
 package main
 
@@ -20,16 +20,16 @@ const (
 func runApp(app *cli.App, graceShutdownC chan struct{}) {
 	app.Commands = append(app.Commands, &cli.Command{
 		Name:  "service",
-		Usage: "Manages the Argo Tunnel launch agent",
+		Usage: "Manages the cloudflared launch agent",
 		Subcommands: []*cli.Command{
 			{
 				Name:   "install",
-				Usage:  "Install Argo Tunnel as an user launch agent",
+				Usage:  "Install cloudflared as an user launch agent",
 				Action: cliutil.ConfiguredAction(installLaunchd),
 			},
 			{
 				Name:   "uninstall",
-				Usage:  "Uninstall the Argo Tunnel launch agent",
+				Usage:  "Uninstall the cloudflared launch agent",
 				Action: cliutil.ConfiguredAction(uninstallLaunchd),
 			},
 		},
@@ -49,6 +49,9 @@ func newLaunchdTemplate(installPath, stdoutPath, stderrPath string) *ServiceTemp
 		<key>ProgramArguments</key>
 		<array>
 			<string>{{ .Path }}</string>
+			{{- range $i, $item := .ExtraArgs}}
+			<string>{{ $item }}</string>
+			{{- end}}
 		</array>
 		<key>RunAtLoad</key>
 		<true/>
@@ -110,13 +113,13 @@ func installLaunchd(c *cli.Context) error {
 	log := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
 
 	if isRootUser() {
-		log.Info().Msg("Installing Argo Tunnel client as a system launch daemon. " +
-			"Argo Tunnel client will run at boot")
+		log.Info().Msg("Installing cloudflared client as a system launch daemon. " +
+			"cloudflared client will run at boot")
 	} else {
-		log.Info().Msg("Installing Argo Tunnel client as an user launch agent. " +
-			"Note that Argo Tunnel client will only run when the user is logged in. " +
-			"If you want to run Argo Tunnel client at boot, install with root permission. " +
-			"For more information, visit https://developers.cloudflare.com/argo-tunnel/reference/service/")
+		log.Info().Msg("Installing cloudflared client as an user launch agent. " +
+			"Note that cloudflared client will only run when the user is logged in. " +
+			"If you want to run cloudflared client at boot, install with root permission. " +
+			"For more information, visit https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/run-tunnel/run-as-service")
 	}
 	etPath, err := os.Executable()
 	if err != nil {
@@ -128,6 +131,13 @@ func installLaunchd(c *cli.Context) error {
 		log.Err(err).Msg("Error determining install path")
 		return errors.Wrap(err, "Error determining install path")
 	}
+	extraArgs, err := getServiceExtraArgsFromCliArgs(c, log)
+	if err != nil {
+		errMsg := "Unable to determine extra arguments for launch daemon"
+		log.Err(err).Msg(errMsg)
+		return errors.Wrap(err, errMsg)
+	}
+
 	stdoutPath, err := stdoutPath()
 	if err != nil {
 		log.Err(err).Msg("error determining stdout path")
@@ -139,7 +149,7 @@ func installLaunchd(c *cli.Context) error {
 		return errors.Wrap(err, "error determining stderr path")
 	}
 	launchdTemplate := newLaunchdTemplate(installPath, stdoutPath, stderrPath)
-	templateArgs := ServiceTemplateArgs{Path: etPath}
+	templateArgs := ServiceTemplateArgs{Path: etPath, ExtraArgs: extraArgs}
 	err = launchdTemplate.Generate(&templateArgs)
 	if err != nil {
 		log.Err(err).Msg("error generating launchd template")
@@ -152,16 +162,20 @@ func installLaunchd(c *cli.Context) error {
 	}
 
 	log.Info().Msgf("Outputs are logged to %s and %s", stderrPath, stdoutPath)
-	return runCommand("launchctl", "load", plistPath)
+	err = runCommand("launchctl", "load", plistPath)
+	if err == nil {
+		log.Info().Msg("MacOS service for cloudflared installed successfully")
+	}
+	return err
 }
 
 func uninstallLaunchd(c *cli.Context) error {
 	log := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
 
 	if isRootUser() {
-		log.Info().Msg("Uninstalling Argo Tunnel as a system launch daemon")
+		log.Info().Msg("Uninstalling cloudflared as a system launch daemon")
 	} else {
-		log.Info().Msg("Uninstalling Argo Tunnel as an user launch agent")
+		log.Info().Msg("Uninstalling cloudflared as a user launch agent")
 	}
 	installPath, err := installPath()
 	if err != nil {
@@ -183,10 +197,13 @@ func uninstallLaunchd(c *cli.Context) error {
 	}
 	err = runCommand("launchctl", "unload", plistPath)
 	if err != nil {
-		log.Err(err).Msg("error unloading")
+		log.Err(err).Msg("error unloading launchd")
 		return err
 	}
 
-	log.Info().Msgf("Outputs are logged to %s and %s", stderrPath, stdoutPath)
-	return launchdTemplate.Remove()
+	err = launchdTemplate.Remove()
+	if err == nil {
+		log.Info().Msg("Launchd for cloudflared was uninstalled successfully")
+	}
+	return err
 }

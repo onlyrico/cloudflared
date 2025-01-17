@@ -1,6 +1,6 @@
-//Package carrier provides a WebSocket proxy to carry or proxy a connection
-//from the local client to the edge. See it as a wrapper around any protocol
-//that it packages up in a WebSocket connection to the edge.
+// Package carrier provides a WebSocket proxy to carry or proxy a connection
+// from the local client to the edge. See it as a wrapper around any protocol
+// that it packages up in a WebSocket connection to the edge.
 package carrier
 
 import (
@@ -54,7 +54,7 @@ func (c *StdinoutStream) Write(p []byte) (int, error) {
 	return os.Stdout.Write(p)
 }
 
-// Helper to allow defering the response close with a check that the resp is not nil
+// Helper to allow deferring the response close with a check that the resp is not nil
 func closeRespBody(resp *http.Response) {
 	if resp != nil {
 		_ = resp.Body.Close()

@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -49,12 +49,12 @@ func (u *UpstreamHTTPS) Exchange(ctx context.Context, query *dns.Msg) (*dns.Msg,
 		for _, bootstrap := range u.bootstraps {
 			endpoint, client, err := configureBootstrap(bootstrap)
 			if err != nil {
-				u.log.Err(err).Msgf("failed to configure boostrap upstream %s", bootstrap)
+				u.log.Err(err).Msgf("failed to configure bootstrap upstream %s", bootstrap)
 				continue
 			}
 			msg, err := exchange(queryBuf, query.Id, endpoint, client, u.log)
 			if err != nil {
-				u.log.Err(err).Msgf("failed to connect to a boostrap upstream %s", bootstrap)
+				u.log.Err(err).Msgf("failed to connect to a bootstrap upstream %s", bootstrap)
 				continue
 			}
 			return msg, nil
@@ -105,7 +105,7 @@ func exchangeWireformat(msg []byte, endpoint *url.URL, client *http.Client) ([]b
 	}
 
 	// Read wireformat response from the body
-	buf, err := ioutil.ReadAll(resp.Body)
+	buf, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read the response body")
 	}

@@ -1,4 +1,4 @@
-//+build linux freebsd openbsd netbsd
+//go:build linux || freebsd || openbsd || netbsd
 
 package token
 

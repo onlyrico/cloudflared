@@ -1,181 +1,122 @@
 package ingress
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"strings"
 
-	"github.com/pkg/errors"
-
-	"github.com/cloudflare/cloudflared/carrier"
-	"github.com/cloudflare/cloudflared/websocket"
-)
-
-var (
-	switchingProtocolText        = fmt.Sprintf("%d %s", http.StatusSwitchingProtocols, http.StatusText(http.StatusSwitchingProtocols))
-	errUnsupportedConnectionType = errors.New("internal error: unsupported connection type")
+	"github.com/rs/zerolog"
 )
 
 // HTTPOriginProxy can be implemented by origin services that want to proxy http requests.
 type HTTPOriginProxy interface {
-	// RoundTrip is how cloudflared proxies eyeball requests to the actual origin services
+	// RoundTripper is how cloudflared proxies eyeball requests to the actual origin services
 	http.RoundTripper
 }
 
 // StreamBasedOriginProxy can be implemented by origin services that want to proxy ws/TCP.
 type StreamBasedOriginProxy interface {
-	EstablishConnection(r *http.Request) (OriginConnection, *http.Response, error)
+	EstablishConnection(ctx context.Context, dest string, log *zerolog.Logger) (OriginConnection, error)
+}
+
+// HTTPLocalProxy can be implemented by cloudflared services that want to handle incoming http requests.
+type HTTPLocalProxy interface {
+	// Handler is how cloudflared proxies eyeball requests to the local cloudflared services
+	http.Handler
 }
 
 func (o *unixSocketPath) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = o.scheme
 	return o.transport.RoundTrip(req)
 }
 
 func (o *httpService) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Rewrite the request URL so that it goes to the origin service.
 	req.URL.Host = o.url.Host
-	req.URL.Scheme = o.url.Scheme
-	if o.hostHeader != "" {
-		// For incoming requests, the Host header is promoted to the Request.Host field and removed from the Header map.
-		req.Host = o.hostHeader
-	}
-	return o.transport.RoundTrip(req)
-}
-
-func (o *httpService) EstablishConnection(req *http.Request) (OriginConnection, *http.Response, error) {
-	req = req.Clone(req.Context())
-
-	req.URL.Host = o.url.Host
-	req.URL.Scheme = o.url.Scheme
-	// allow ws(s) scheme for websocket-only origins, normal http(s) requests will fail
-	switch req.URL.Scheme {
+	switch o.url.Scheme {
 	case "ws":
 		req.URL.Scheme = "http"
 	case "wss":
 		req.URL.Scheme = "https"
+	default:
+		req.URL.Scheme = o.url.Scheme
 	}
 
 	if o.hostHeader != "" {
 		// For incoming requests, the Host header is promoted to the Request.Host field and removed from the Header map.
+		// Pass the original Host header as X-Forwarded-Host.
+		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Host = o.hostHeader
 	}
 
-	return o.newWebsocketProxyConnection(req)
+	if o.matchSNIToHost {
+		o.SetOriginServerName(req)
+	}
+
+	return o.transport.RoundTrip(req)
 }
 
-func (o *httpService) newWebsocketProxyConnection(req *http.Request) (OriginConnection, *http.Response, error) {
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	req.Header.Set("Sec-WebSocket-Version", "13")
-
-	req.ContentLength = 0
-	req.Body = nil
-
-	resp, err := o.transport.RoundTrip(req)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	toClose := resp.Body
-	defer func() {
-		if toClose != nil {
-			_ = toClose.Close()
+func (o *httpService) SetOriginServerName(req *http.Request) {
+	o.transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := o.transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
 		}
-	}()
-
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return nil, nil, fmt.Errorf("unexpected origin response: %s", resp.Status)
+		return tls.Client(conn, &tls.Config{
+			RootCAs:            o.transport.TLSClientConfig.RootCAs,
+			InsecureSkipVerify: o.transport.TLSClientConfig.InsecureSkipVerify,
+			ServerName:         req.Host,
+		}), nil
 	}
-	if strings.ToLower(resp.Header.Get("Upgrade")) != "websocket" {
-		return nil, nil, fmt.Errorf("unexpected upgrade: %q", resp.Header.Get("Upgrade"))
-	}
-
-	rwc, ok := resp.Body.(io.ReadWriteCloser)
-	if !ok {
-		return nil, nil, errUnsupportedConnectionType
-	}
-	conn := wsProxyConnection{
-		rwc: rwc,
-	}
-	// clear to prevent defer from closing
-	toClose = nil
-
-	return &conn, resp, nil
 }
 
 func (o *statusCode) RoundTrip(_ *http.Request) (*http.Response, error) {
-	return o.resp, nil
+	if o.defaultResp {
+		o.log.Warn().Msgf(ErrNoIngressRulesCLI.Error())
+	}
+	resp := &http.Response{
+		StatusCode: o.code,
+		Status:     fmt.Sprintf("%d %s", o.code, http.StatusText(o.code)),
+		Body:       new(NopReadCloser),
+	}
+
+	return resp, nil
 }
 
-func (o *rawTCPService) EstablishConnection(r *http.Request) (OriginConnection, *http.Response, error) {
-	dest, err := getRequestHost(r)
+func (o *rawTCPService) EstablishConnection(ctx context.Context, dest string, logger *zerolog.Logger) (OriginConnection, error) {
+	conn, err := o.dialer.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		return nil, nil, err
-	}
-	conn, err := net.Dial("tcp", dest)
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	originConn := &tcpConnection{
-		conn: conn,
+		Conn:         conn,
+		writeTimeout: o.writeTimeout,
+		logger:       logger,
 	}
-	resp := &http.Response{
-		Status:        switchingProtocolText,
-		StatusCode:    http.StatusSwitchingProtocols,
-		ContentLength: -1,
-	}
-	return originConn, resp, nil
+	return originConn, nil
 }
 
-// getRequestHost returns the host of the http.Request.
-func getRequestHost(r *http.Request) (string, error) {
-	if r.Host != "" {
-		return r.Host, nil
-	}
-	if r.URL != nil {
-		return r.URL.Host, nil
-	}
-	return "", errors.New("host not found")
-}
-
-func (o *tcpOverWSService) EstablishConnection(r *http.Request) (OriginConnection, *http.Response, error) {
+func (o *tcpOverWSService) EstablishConnection(ctx context.Context, dest string, _ *zerolog.Logger) (OriginConnection, error) {
 	var err error
-	dest := o.dest
-	if o.isBastion {
-		dest, err = carrier.ResolveBastionDest(r)
-		if err != nil {
-			return nil, nil, err
-		}
+	if !o.isBastion {
+		dest = o.dest
 	}
 
-	conn, err := net.Dial("tcp", dest)
+	conn, err := o.dialer.DialContext(ctx, "tcp", dest)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	originConn := &tcpOverWSConnection{
 		conn:          conn,
 		streamHandler: o.streamHandler,
 	}
-	resp := &http.Response{
-		Status:        switchingProtocolText,
-		StatusCode:    http.StatusSwitchingProtocols,
-		Header:        websocket.NewResponseHeader(r),
-		ContentLength: -1,
-	}
-	return originConn, resp, nil
+	return originConn, nil
 
 }
 
-func (o *socksProxyOverWSService) EstablishConnection(r *http.Request) (OriginConnection, *http.Response, error) {
-	originConn := o.conn
-	resp := &http.Response{
-		Status:        switchingProtocolText,
-		StatusCode:    http.StatusSwitchingProtocols,
-		Header:        websocket.NewResponseHeader(r),
-		ContentLength: -1,
-	}
-	return originConn, resp, nil
+func (o *socksProxyOverWSService) EstablishConnection(_ context.Context, _ string, _ *zerolog.Logger) (OriginConnection, error) {
+	return o.conn, nil
 }

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	baseStoreURL  = "https://login.argotunnel.com/"
+	baseStoreURL  = "https://login.cloudflareaccess.org/"
 	clientTimeout = time.Second * 60
 )
 
@@ -25,12 +25,12 @@ const (
 // The "dance" we refer to is building a HTTP request, opening that in a browser waiting for
 // the user to complete an action, while it long polls in the background waiting for an
 // action to be completed to download the resource.
-func RunTransfer(transferURL *url.URL, resourceName, key, value string, shouldEncrypt bool, useHostOnly bool, log *zerolog.Logger) ([]byte, error) {
+func RunTransfer(transferURL *url.URL, appAUD, resourceName, key, value string, shouldEncrypt bool, useHostOnly bool, log *zerolog.Logger) ([]byte, error) {
 	encrypterClient, err := NewEncrypter("cloudflared_priv.pem", "cloudflared_pub.pem")
 	if err != nil {
 		return nil, err
 	}
-	requestURL, err := buildRequestURL(transferURL, key, value+encrypterClient.PublicKey(), shouldEncrypt, useHostOnly)
+	requestURL, err := buildRequestURL(transferURL, appAUD, key, value+encrypterClient.PublicKey(), shouldEncrypt, useHostOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -76,18 +76,21 @@ func RunTransfer(transferURL *url.URL, resourceName, key, value string, shouldEn
 // BuildRequestURL creates a request suitable for a resource transfer.
 // it will return a constructed url based off the base url and query key/value provided.
 // cli will build a url for cli transfer request.
-func buildRequestURL(baseURL *url.URL, key, value string, cli, useHostOnly bool) (string, error) {
+func buildRequestURL(baseURL *url.URL, appAUD string, key, value string, cli, useHostOnly bool) (string, error) {
 	q := baseURL.Query()
 	q.Set(key, value)
+	q.Set("aud", appAUD)
 	baseURL.RawQuery = q.Encode()
 	if useHostOnly {
 		baseURL.Path = ""
 	}
+	// TODO: pass arg for tunnel login
 	if !cli {
 		return baseURL.String(), nil
 	}
 	q.Set("redirect_url", baseURL.String()) // we add the token as a query param on both the redirect_url and the main url
 	q.Set("send_org_token", "true")         // indicates that the cli endpoint should return both the org and app token
+	q.Set("edge_token_transfer", "true")    // use new LoginHelper service built on workers
 	baseURL.RawQuery = q.Encode()           // and this actual baseURL.
 	baseURL.Path = "cdn-cgi/access/cli"
 	return baseURL.String(), nil
@@ -103,9 +106,6 @@ func transferRequest(requestURL string, log *zerolog.Logger) ([]byte, string, er
 		if err != nil {
 			return nil, "", err
 		} else if len(buf) > 0 {
-			if err := putSuccess(client, requestURL); err != nil {
-				log.Err(err).Msg("Failed to update resource success")
-			}
 			return buf, key, nil
 		}
 	}
@@ -114,7 +114,12 @@ func transferRequest(requestURL string, log *zerolog.Logger) ([]byte, string, er
 
 // poll the endpoint for the request resource, waiting for the user interaction
 func poll(client *http.Client, requestURL string, log *zerolog.Logger) ([]byte, string, error) {
-	resp, err := client.Get(requestURL)
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -135,23 +140,4 @@ func poll(client *http.Client, requestURL string, log *zerolog.Logger) ([]byte, 
 		return nil, "", err
 	}
 	return buf.Bytes(), resp.Header.Get("service-public-key"), nil
-}
-
-// putSuccess tells the server we successfully downloaded the resource
-func putSuccess(client *http.Client, requestURL string) error {
-	req, err := http.NewRequest("PUT", requestURL+"/ok", nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP Response Status Code: %d", resp.StatusCode)
-	}
-	return nil
 }

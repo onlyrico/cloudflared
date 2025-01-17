@@ -1,11 +1,15 @@
 package connection
 
+import "net"
+
 // Event is something that happened to a connection, e.g. disconnection or registration.
 type Event struct {
-	Index     uint8
-	EventType Status
-	Location  string
-	URL       string
+	Index       uint8
+	EventType   Status
+	Location    string
+	Protocol    Protocol
+	URL         string
+	EdgeAddress net.IP
 }
 
 // Status is the status of a connection.
@@ -18,7 +22,7 @@ const (
 	Connected
 	// Reconnecting means the connection to the edge is being re-established.
 	Reconnecting
-	// SetURL means this connection's tunnel was given a URL by the edge. Used for free tunnels.
+	// SetURL means this connection's tunnel was given a URL by the edge. Used for quick tunnels.
 	SetURL
 	// RegisteringTunnel means the non-named tunnel is registering its connection.
 	RegisteringTunnel

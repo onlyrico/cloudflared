@@ -11,84 +11,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 	"github.com/urfave/cli/v2"
 
+	"github.com/cloudflare/cloudflared/cfapi"
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/tunnelstore"
+	"github.com/cloudflare/cloudflared/credentials"
 )
-
-func Test_findIDs(t *testing.T) {
-	type args struct {
-		tunnels []*tunnelstore.Tunnel
-		inputs  []string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    []uuid.UUID
-		wantErr bool
-	}{
-		{
-			name: "input not found",
-			args: args{
-				inputs: []string{"asdf"},
-			},
-			wantErr: true,
-		},
-		{
-			name: "only UUID",
-			args: args{
-				inputs: []string{"a8398a0b-876d-48ed-b609-3fcfd67a4950"},
-			},
-			want: []uuid.UUID{uuid.MustParse("a8398a0b-876d-48ed-b609-3fcfd67a4950")},
-		},
-		{
-			name: "only name",
-			args: args{
-				tunnels: []*tunnelstore.Tunnel{
-					{
-						ID:   uuid.MustParse("a8398a0b-876d-48ed-b609-3fcfd67a4950"),
-						Name: "tunnel1",
-					},
-				},
-				inputs: []string{"tunnel1"},
-			},
-			want: []uuid.UUID{uuid.MustParse("a8398a0b-876d-48ed-b609-3fcfd67a4950")},
-		},
-		{
-			name: "both UUID and name",
-			args: args{
-				tunnels: []*tunnelstore.Tunnel{
-					{
-						ID:   uuid.MustParse("a8398a0b-876d-48ed-b609-3fcfd67a4950"),
-						Name: "tunnel1",
-					},
-					{
-						ID:   uuid.MustParse("bf028b68-744f-466e-97f8-c46161d80aa5"),
-						Name: "tunnel2",
-					},
-				},
-				inputs: []string{"tunnel1", "bf028b68-744f-466e-97f8-c46161d80aa5"},
-			},
-			want: []uuid.UUID{
-				uuid.MustParse("a8398a0b-876d-48ed-b609-3fcfd67a4950"),
-				uuid.MustParse("bf028b68-744f-466e-97f8-c46161d80aa5"),
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := findIDs(tt.args.tunnels, tt.args.inputs)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("findIDs() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("findIDs() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
 
 type mockFileSystem struct {
 	rf  func(string) ([]byte, error)
@@ -107,10 +36,9 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 	type fields struct {
 		c                 *cli.Context
 		log               *zerolog.Logger
-		isUIEnabled       bool
 		fs                fileSystem
-		tunnelstoreClient tunnelstore.Client
-		userCredential    *userCredential
+		tunnelstoreClient cfapi.Client
+		userCredential    *credentials.User
 	}
 	type args struct {
 		tunnelID uuid.UUID
@@ -188,7 +116,50 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 				AccountTag:   accountTag,
 				TunnelID:     tunnelID,
 				TunnelSecret: secret,
-				TunnelName:   name,
+			},
+		},
+		{
+			name: "TUNNEL_CRED_CONTENTS given contains old credentials contents",
+			fields: fields{
+				log: &log,
+				fs:  fs,
+				c: func() *cli.Context {
+					flagSet := flag.NewFlagSet("test0", flag.PanicOnError)
+					flagSet.String(CredContentsFlag, "", "")
+					c := cli.NewContext(cli.NewApp(), flagSet, nil)
+					_ = c.Set(CredContentsFlag, fmt.Sprintf(`{"AccountTag":"%s","TunnelSecret":"%s"}`, accountTag, secretB64))
+					return c
+				}(),
+			},
+			args: args{
+				tunnelID: tunnelID,
+			},
+			want: connection.Credentials{
+				AccountTag:   accountTag,
+				TunnelID:     tunnelID,
+				TunnelSecret: secret,
+			},
+		},
+		{
+			name: "TUNNEL_CRED_CONTENTS given contains new credentials contents",
+			fields: fields{
+				log: &log,
+				fs:  fs,
+				c: func() *cli.Context {
+					flagSet := flag.NewFlagSet("test0", flag.PanicOnError)
+					flagSet.String(CredContentsFlag, "", "")
+					c := cli.NewContext(cli.NewApp(), flagSet, nil)
+					_ = c.Set(CredContentsFlag, fmt.Sprintf(`{"AccountTag":"%s","TunnelSecret":"%s","TunnelID":"%s","TunnelName":"%s"}`, accountTag, secretB64, tunnelID, name))
+					return c
+				}(),
+			},
+			args: args{
+				tunnelID: tunnelID,
+			},
+			want: connection.Credentials{
+				AccountTag:   accountTag,
+				TunnelID:     tunnelID,
+				TunnelSecret: secret,
 			},
 		},
 	}
@@ -197,7 +168,6 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 			sc := &subcommandContext{
 				c:                 tt.fields.c,
 				log:               tt.fields.log,
-				isUIEnabled:       tt.fields.isUIEnabled,
 				fs:                tt.fields.fs,
 				tunnelstoreClient: tt.fields.tunnelstoreClient,
 				userCredential:    tt.fields.userCredential,
@@ -215,13 +185,13 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 }
 
 type deleteMockTunnelStore struct {
-	tunnelstore.Client
+	cfapi.Client
 	mockTunnels      map[uuid.UUID]mockTunnelBehaviour
 	deletedTunnelIDs []uuid.UUID
 }
 
 type mockTunnelBehaviour struct {
-	tunnel     tunnelstore.Tunnel
+	tunnel     cfapi.Tunnel
 	deleteErr  error
 	cleanupErr error
 }
@@ -237,7 +207,7 @@ func newDeleteMockTunnelStore(tunnels ...mockTunnelBehaviour) *deleteMockTunnelS
 	}
 }
 
-func (d *deleteMockTunnelStore) GetTunnel(tunnelID uuid.UUID) (*tunnelstore.Tunnel, error) {
+func (d *deleteMockTunnelStore) GetTunnel(tunnelID uuid.UUID) (*cfapi.Tunnel, error) {
 	tunnel, ok := d.mockTunnels[tunnelID]
 	if !ok {
 		return nil, fmt.Errorf("Couldn't find tunnel: %v", tunnelID)
@@ -245,7 +215,11 @@ func (d *deleteMockTunnelStore) GetTunnel(tunnelID uuid.UUID) (*tunnelstore.Tunn
 	return &tunnel.tunnel, nil
 }
 
-func (d *deleteMockTunnelStore) DeleteTunnel(tunnelID uuid.UUID) error {
+func (d *deleteMockTunnelStore) GetTunnelToken(tunnelID uuid.UUID) (string, error) {
+	return "token", nil
+}
+
+func (d *deleteMockTunnelStore) DeleteTunnel(tunnelID uuid.UUID, cascade bool) error {
 	tunnel, ok := d.mockTunnels[tunnelID]
 	if !ok {
 		return fmt.Errorf("Couldn't find tunnel: %v", tunnelID)
@@ -261,7 +235,7 @@ func (d *deleteMockTunnelStore) DeleteTunnel(tunnelID uuid.UUID) error {
 	return nil
 }
 
-func (d *deleteMockTunnelStore) CleanupConnections(tunnelID uuid.UUID, _ *tunnelstore.CleanupParams) error {
+func (d *deleteMockTunnelStore) CleanupConnections(tunnelID uuid.UUID, _ *cfapi.CleanupParams) error {
 	tunnel, ok := d.mockTunnels[tunnelID]
 	if !ok {
 		return fmt.Errorf("Couldn't find tunnel: %v", tunnelID)
@@ -276,7 +250,7 @@ func Test_subcommandContext_Delete(t *testing.T) {
 		isUIEnabled       bool
 		fs                fileSystem
 		tunnelstoreClient *deleteMockTunnelStore
-		userCredential    *userCredential
+		userCredential    *credentials.User
 	}
 	type args struct {
 		tunnelIDs []uuid.UUID
@@ -312,10 +286,10 @@ func Test_subcommandContext_Delete(t *testing.T) {
 				}(),
 				tunnelstoreClient: newDeleteMockTunnelStore(
 					mockTunnelBehaviour{
-						tunnel: tunnelstore.Tunnel{ID: tunnelID1},
+						tunnel: cfapi.Tunnel{ID: tunnelID1},
 					},
 					mockTunnelBehaviour{
-						tunnel: tunnelstore.Tunnel{ID: tunnelID2},
+						tunnel: cfapi.Tunnel{ID: tunnelID2},
 					},
 				),
 			},
@@ -332,7 +306,6 @@ func Test_subcommandContext_Delete(t *testing.T) {
 			sc := &subcommandContext{
 				c:                 tt.fields.c,
 				log:               tt.fields.log,
-				isUIEnabled:       tt.fields.isUIEnabled,
 				fs:                tt.fields.fs,
 				tunnelstoreClient: tt.fields.tunnelstoreClient,
 				userCredential:    tt.fields.userCredential,
@@ -346,6 +319,51 @@ func Test_subcommandContext_Delete(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("subcommandContext.findCredentials() = %v, want %v", got, tt.want)
 				return
+			}
+		})
+	}
+}
+
+func Test_subcommandContext_ValidateIngressCommand(t *testing.T) {
+	var tests = []struct {
+		name        string
+		c           *cli.Context
+		wantErr     bool
+		expectedErr error
+	}{
+		{
+			name: "read a valid configuration from data",
+			c: func() *cli.Context {
+				data := `{ "warp-routing": {"enabled": true},  "originRequest" : {"connectTimeout": 10}, "ingress" : [ {"hostname": "test", "service": "https://localhost:8000" } , {"service": "http_status:404"} ]}`
+				flagSet := flag.NewFlagSet("json", flag.PanicOnError)
+				flagSet.String(ingressDataJSONFlagName, data, "")
+				c := cli.NewContext(cli.NewApp(), flagSet, nil)
+				_ = c.Set(ingressDataJSONFlagName, data)
+				return c
+			}(),
+		},
+		{
+			name: "read an invalid configuration with multiple mistakes",
+			c: func() *cli.Context {
+				data := `{ "ingress" : [ {"hostname": "test", "service": "localhost:8000" } , {"service": "http_status:invalid_status"} ]}`
+				flagSet := flag.NewFlagSet("json", flag.PanicOnError)
+				flagSet.String(ingressDataJSONFlagName, data, "")
+				c := cli.NewContext(cli.NewApp(), flagSet, nil)
+				_ = c.Set(ingressDataJSONFlagName, data)
+				return c
+			}(),
+			wantErr:     true,
+			expectedErr: errors.New("Validation failed: localhost:8000 is an invalid address, please make sure it has a scheme and a hostname"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIngressCommand(tt.c, "")
+			if tt.wantErr {
+				assert.Equal(t, tt.expectedErr.Error(), err.Error())
+			} else {
+				assert.Nil(t, err)
 			}
 		})
 	}

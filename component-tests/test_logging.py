@@ -2,23 +2,34 @@
 import json
 import os
 
+from constants import MAX_LOG_LINES
 from util import start_cloudflared, wait_tunnel_ready, send_requests
 
 # Rolling logger rotate log files after 1 MB
 rotate_after_size = 1000 * 1000
 default_log_file = "cloudflared.log"
-expect_message = "Starting Hello World server"
+expect_message = "Starting Hello"
 
 
 def assert_log_to_terminal(cloudflared):
-    stderr = cloudflared.stderr.read(1500)
-    assert expect_message.encode() in stderr, f"{stderr} doesn't contain {expect_message}"
+    for _ in range(0, MAX_LOG_LINES):
+        line = cloudflared.stderr.readline()
+        if not line:
+            break
+        if expect_message.encode() in line:
+            return
+    raise Exception(f"terminal log doesn't contain {expect_message}")
 
 
 def assert_log_in_file(file):
     with open(file, "r") as f:
-        log = f.read(1850)
-        assert expect_message in log, f"{log} doesn't contain {expect_message}"
+        for _ in range(0, MAX_LOG_LINES):
+            line = f.readline()
+            if not line:
+                break
+            if expect_message in line:
+                return
+    raise Exception(f"log file doesn't contain {expect_message}")
 
 
 def assert_json_log(file):
@@ -63,7 +74,7 @@ def assert_log_to_dir(config, log_dir):
 class TestLogging:
     def test_logging_to_terminal(self, tmp_path, component_tests_config):
         config = component_tests_config()
-        with start_cloudflared(tmp_path, config, new_process=True) as cloudflared:
+        with start_cloudflared(tmp_path, config, cfd_pre_args=["tunnel", "--ha-connections", "1"], new_process=True) as cloudflared:
             wait_tunnel_ready(tunnel_url=config.get_url())
             assert_log_to_terminal(cloudflared)
 
@@ -74,8 +85,8 @@ class TestLogging:
             "logfile": str(log_file),
         }
         config = component_tests_config(extra_config)
-        with start_cloudflared(tmp_path, config, new_process=True, capture_output=False):
-            wait_tunnel_ready(tunnel_url=config.get_url())
+        with start_cloudflared(tmp_path, config, cfd_pre_args=["tunnel", "--ha-connections", "1"], new_process=True, capture_output=False):
+            wait_tunnel_ready(tunnel_url=config.get_url(), cfd_logs=str(log_file))
             assert_log_in_file(log_file)
             assert_json_log(log_file)
 
@@ -87,6 +98,6 @@ class TestLogging:
             "log-directory": str(log_dir),
         }
         config = component_tests_config(extra_config)
-        with start_cloudflared(tmp_path, config, new_process=True, capture_output=False):
-            wait_tunnel_ready(tunnel_url=config.get_url())
+        with start_cloudflared(tmp_path, config, cfd_pre_args=["tunnel", "--ha-connections", "1"], new_process=True, capture_output=False):
+            wait_tunnel_ready(tunnel_url=config.get_url(), cfd_logs=str(log_dir))
             assert_log_to_dir(config, log_dir)

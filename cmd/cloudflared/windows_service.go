@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package main
 
@@ -25,8 +25,8 @@ import (
 
 const (
 	windowsServiceName        = "Cloudflared"
-	windowsServiceDescription = "Argo Tunnel agent"
-	windowsServiceUrl         = "https://developers.cloudflare.com/argo-tunnel/reference/service/"
+	windowsServiceDescription = "Cloudflared agent"
+	windowsServiceUrl         = "https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/run-tunnel/as-a-service/windows/"
 
 	recoverActionDelay      = time.Second * 20
 	failureCountResetPeriod = time.Hour * 24
@@ -45,16 +45,16 @@ const (
 func runApp(app *cli.App, graceShutdownC chan struct{}) {
 	app.Commands = append(app.Commands, &cli.Command{
 		Name:  "service",
-		Usage: "Manages the Argo Tunnel Windows service",
+		Usage: "Manages the cloudflared Windows service",
 		Subcommands: []*cli.Command{
 			{
 				Name:   "install",
-				Usage:  "Install Argo Tunnel as a Windows service",
+				Usage:  "Install cloudflared as a Windows service",
 				Action: cliutil.ConfiguredAction(installWindowsService),
 			},
 			{
 				Name:   "uninstall",
-				Usage:  "Uninstall the Argo Tunnel service",
+				Usage:  "Uninstall the cloudflared service",
 				Action: cliutil.ConfiguredAction(uninstallWindowsService),
 			},
 		},
@@ -176,7 +176,7 @@ func (s *windowsService) Execute(serviceArgs []string, r <-chan svc.ChangeReques
 func installWindowsService(c *cli.Context) error {
 	zeroLogger := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
 
-	zeroLogger.Info().Msg("Installing Argo Tunnel Windows service")
+	zeroLogger.Info().Msg("Installing cloudflared Windows service")
 	exepath, err := os.Executable()
 	if err != nil {
 		return errors.Wrap(err, "Cannot find path name that start the process")
@@ -190,26 +190,39 @@ func installWindowsService(c *cli.Context) error {
 	log := zeroLogger.With().Str(LogFieldWindowsServiceName, windowsServiceName).Logger()
 	if err == nil {
 		s.Close()
-		return fmt.Errorf("Service %s already exists", windowsServiceName)
+		return fmt.Errorf(serviceAlreadyExistsWarn(windowsServiceName))
 	}
+	extraArgs, err := getServiceExtraArgsFromCliArgs(c, &log)
+	if err != nil {
+		errMsg := "Unable to determine extra arguments for windows service"
+		log.Err(err).Msg(errMsg)
+		return errors.Wrap(err, errMsg)
+	}
+
 	config := mgr.Config{StartType: mgr.StartAutomatic, DisplayName: windowsServiceDescription}
-	s, err = m.CreateService(windowsServiceName, exepath, config)
+	s, err = m.CreateService(windowsServiceName, exepath, config, extraArgs...)
 	if err != nil {
 		return errors.Wrap(err, "Cannot install service")
 	}
 	defer s.Close()
-	log.Info().Msg("Argo Tunnel agent service is installed")
+	log.Info().Msg("cloudflared agent service is installed")
 	err = eventlog.InstallAsEventCreate(windowsServiceName, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		s.Delete()
 		return errors.Wrap(err, "Cannot install event logger")
 	}
+
 	err = configRecoveryOption(s.Handle)
 	if err != nil {
 		log.Err(err).Msg("Cannot set service recovery actions")
 		log.Info().Msgf("See %s to manually configure service recovery actions", windowsServiceUrl)
 	}
-	return nil
+
+	err = s.Start()
+	if err == nil {
+		log.Info().Msg("Agent service for cloudflared installed successfully")
+	}
+	return err
 }
 
 func uninstallWindowsService(c *cli.Context) error {
@@ -217,7 +230,7 @@ func uninstallWindowsService(c *cli.Context) error {
 		With().
 		Str(LogFieldWindowsServiceName, windowsServiceName).Logger()
 
-	log.Info().Msg("Uninstalling Argo Tunnel Windows Service")
+	log.Info().Msg("Uninstalling cloudflared agent service")
 	m, err := mgr.Connect()
 	if err != nil {
 		return errors.Wrap(err, "Cannot establish a connection to the service control manager")
@@ -225,14 +238,22 @@ func uninstallWindowsService(c *cli.Context) error {
 	defer m.Disconnect()
 	s, err := m.OpenService(windowsServiceName)
 	if err != nil {
-		return fmt.Errorf("Service %s is not installed", windowsServiceName)
+		return fmt.Errorf("Agent service %s is not installed, so it could not be uninstalled", windowsServiceName)
 	}
 	defer s.Close()
+
+	if status, err := s.Query(); err == nil && status.State == svc.Running {
+		log.Info().Msg("Stopping cloudflared agent service")
+		if _, err := s.Control(svc.Stop); err != nil {
+			log.Info().Err(err).Msg("Failed to stop cloudflared agent service, you may need to stop it manually to complete uninstall.")
+		}
+	}
+
 	err = s.Delete()
 	if err != nil {
-		return errors.Wrap(err, "Cannot delete service")
+		return errors.Wrap(err, "Cannot delete agent service")
 	}
-	log.Info().Msg("Argo Tunnel agent service is uninstalled")
+	log.Info().Msg("Agent service for cloudflared was uninstalled successfully")
 	err = eventlog.Remove(windowsServiceName)
 	if err != nil {
 		return errors.Wrap(err, "Cannot remove event logger")
